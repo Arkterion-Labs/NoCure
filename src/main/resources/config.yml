@@ -1,0 +1,10 @@
+notifications:
+  console: true
+  operators: false
+  discordsrv: false
+  discordsrv-channel: staff-chat
+
+  # Minimum time before the same player's cure attempt is reported again.
+  # Cure attempts are ALWAYS blocked regardless of this setting.
+  # Set to 0 to disable the notification cooldown.
+  cooldown-seconds: 5

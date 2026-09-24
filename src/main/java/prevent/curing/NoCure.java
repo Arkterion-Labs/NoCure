@@ -13,101 +13,154 @@ import org.bukkit.event.EventHandler;
 import org.bukkit.event.Listener;
 import org.bukkit.event.entity.EntityTransformEvent;
 import org.bukkit.event.entity.PotionSplashEvent;
-import org.bukkit.event.player.PlayerInteractEntityEvent;
+import org.bukkit.event.player.PlayerInteractAtEntityEvent;
 import org.bukkit.inventory.ItemStack;
 import org.bukkit.potion.PotionEffectType;
 import org.bukkit.plugin.java.JavaPlugin;
 
-import java.util.HashMap;
 import java.util.Map;
 import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
 
 public class NoCure extends JavaPlugin implements Listener {
 
-    private final Map<UUID, UUID> weaknessAppliedTracker = new HashMap<>();
+    private final Map<UUID, UUID> weaknessAppliedTracker = new ConcurrentHashMap<>();
+    private final Map<UUID, Long> notificationCooldowns = new ConcurrentHashMap<>();
 
     @Override
     public void onEnable() {
+        saveDefaultConfig();
         Bukkit.getPluginManager().registerEvents(this, this);
-        getLogger().info("[NoCure] Plugin has been enabled!");
+        getLogger().info("NoCure has been enabled!");
     }
 
     @Override
     public void onDisable() {
-        getLogger().info("[NoCure] Plugin has been disabled.");
+        weaknessAppliedTracker.clear();
+        notificationCooldowns.clear();
+        getLogger().info("NoCure has been disabled.");
+    }
+
+    /** Tracks which player most recently applied a splash Weakness potion. */
+    @EventHandler(ignoreCancelled = true)
+    public void onWeaknessPotion(PotionSplashEvent event) {
+        if (event.getPotion().getEffects() == null || event.getPotion().getEffects().stream()
+                .noneMatch(effect -> effect.getType().equals(PotionEffectType.WEAKNESS))) {
+            return;
+        }
+
+        if (!(event.getEntity().getShooter() instanceof Player thrower)) {
+            return;
+        }
+
+        event.getAffectedEntities().stream()
+                .filter(ZombieVillager.class::isInstance)
+                .forEach(entity -> weaknessAppliedTracker.put(entity.getUniqueId(), thrower.getUniqueId()));
+    }
+
+    /** Blocks the golden-apple interaction before a cure can begin. */
+    @EventHandler(ignoreCancelled = true)
+    public void onGoldenAppleUse(PlayerInteractAtEntityEvent event) {
+        if (!(event.getRightClicked() instanceof ZombieVillager zombieVillager)) {
+            return;
+        }
+
+        ItemStack usedItem = event.getPlayer().getInventory().getItem(event.getHand());
+        if (usedItem == null || usedItem.getType() != Material.GOLDEN_APPLE) {
+            return;
+        }
+
+        // Always block the cure attempt, regardless of notification cooldown.
+        event.setCancelled(true);
+
+        UUID trackedPlayerId = weaknessAppliedTracker.remove(zombieVillager.getUniqueId());
+        Player curingPlayer = trackedPlayerId != null ? Bukkit.getPlayer(trackedPlayerId) : event.getPlayer();
+
+        UUID playerId = curingPlayer != null
+                ? curingPlayer.getUniqueId()
+                : event.getPlayer().getUniqueId();
+
+        String playerName = curingPlayer != null
+                ? curingPlayer.getName()
+                : event.getPlayer().getName();
+
+        notifyAttempt(playerId, playerName, zombieVillager.getLocation());
     }
 
     /**
-     * Detects when a player throws a Weakness potion at a zombie villager.
+     * Final safety net: Paper exposes CURED specifically for zombie-villager cures.
+     * If another plugin or a future interaction path starts conversion anyway,
+     * the actual Zombie Villager -> Villager transformation is still cancelled.
      */
-    @EventHandler
-    public void onWeaknessPotion(PotionSplashEvent event) {
-        if (event.getPotion().getEffects().stream().anyMatch(effect -> effect.getType().equals(PotionEffectType.WEAKNESS))) {
-            event.getAffectedEntities().forEach(entity -> {
-                if (entity instanceof ZombieVillager) {
-                    Player thrower = event.getEntity().getShooter() instanceof Player ? (Player) event.getEntity().getShooter() : null;
-                    if (thrower != null) {
-                        weaknessAppliedTracker.put(entity.getUniqueId(), thrower.getUniqueId());
-                    }
-                }
-            });
+    @EventHandler(ignoreCancelled = true)
+    public void onZombieVillagerCure(EntityTransformEvent event) {
+        if (event.getTransformReason() == EntityTransformEvent.TransformReason.CURED
+                && event.getEntityType() == EntityType.ZOMBIE_VILLAGER
+                && event.getTransformedEntity().getType() == EntityType.VILLAGER) {
+            event.setCancelled(true);
+            weaknessAppliedTracker.remove(event.getEntity().getUniqueId());
         }
     }
 
-    /**
-     * Cancels the curing process before it starts.
-     */
-    @EventHandler
-    public void onGoldenAppleUse(PlayerInteractEntityEvent event) {
-        if (event.getRightClicked() instanceof ZombieVillager) {
-            Player player = event.getPlayer();
-            ItemStack item = player.getInventory().getItemInMainHand();
+    private void notifyAttempt(UUID playerId, String playerName, Location location) {
+        long cooldownSeconds = Math.max(
+                0L,
+                getConfig().getLong("notifications.cooldown-seconds", 5L)
+        );
 
-            if (item.getType() == Material.GOLDEN_APPLE) {
-                event.setCancelled(true); // Block the cure attempt
+        long now = System.currentTimeMillis();
+        long cooldownMillis = cooldownSeconds * 1000L;
 
-                UUID zombieID = event.getRightClicked().getUniqueId();
-                UUID playerID = weaknessAppliedTracker.get(zombieID);
-                weaknessAppliedTracker.remove(zombieID);
+        Long lastNotification = notificationCooldowns.get(playerId);
 
-                Player curingPlayer = (playerID != null) ? Bukkit.getPlayer(playerID) : player;
-                String playerName = (curingPlayer != null) ? curingPlayer.getName() : "Unknown Player";
-                Location loc = event.getRightClicked().getLocation();
-                String coordinates = "X:" + loc.getBlockX() + " Y:" + loc.getBlockY() + " Z:" + loc.getBlockZ();
+        if (lastNotification != null && now - lastNotification < cooldownMillis) {
+            return;
+        }
 
-                String message = playerName + " tried to cure a zombie villager at " + coordinates;
-                String inGameMessage = ChatColor.RED + "[NoCure] " + ChatColor.YELLOW + message;
+        notificationCooldowns.put(playerId, now);
 
-                // Log to server console
-                getLogger().warning("[NoCure] " + message);
+        String coordinates = "X:" + location.getBlockX()
+                + " Y:" + location.getBlockY()
+                + " Z:" + location.getBlockZ();
 
-                // Send message to OP players in-game
-                for (Player p : Bukkit.getOnlinePlayers()) {
-                    if (p.isOp()) {
-                        p.sendMessage(inGameMessage);
-                    }
-                }
+        String message = playerName
+                + " tried to cure a zombie villager at "
+                + coordinates;
 
-                // Send message to DiscordSRV staff chat
-                if (Bukkit.getPluginManager().isPluginEnabled("DiscordSRV")) {
-                    TextChannel textChannel = DiscordSRV.getPlugin().getDestinationTextChannelForGameChannelName("staff-chat");
-                    if (textChannel != null) {
-                        textChannel.sendMessage("**[NoCure]** " + message).queue();
-                    } else {
-                        getLogger().warning("[NoCure] Could not find DiscordSRV staff-chat channel.");
-                    }
+        if (getConfig().getBoolean("notifications.console", true)) {
+            getLogger().warning(message);
+        }
+
+        if (getConfig().getBoolean("notifications.operators", false)) {
+            String inGameMessage =
+                    ChatColor.RED + "[NoCure] "
+                            + ChatColor.YELLOW + message;
+
+            for (Player player : Bukkit.getOnlinePlayers()) {
+                if (player.isOp()) {
+                    player.sendMessage(inGameMessage);
                 }
             }
         }
-    }
 
-    //Stop the transformation if needed
-    @EventHandler
-    public void onZombieVillagerCure(EntityTransformEvent event) {
-        if (event.getTransformReason() == EntityTransformEvent.TransformReason.CURED) {
-            if (event.getEntityType() == EntityType.ZOMBIE_VILLAGER && event.getTransformedEntity().getType() == EntityType.VILLAGER) {
-                event.setCancelled(true);
+        if (getConfig().getBoolean("notifications.discordsrv", false)
+                && Bukkit.getPluginManager().isPluginEnabled("DiscordSRV")) {
 
+            String channelName = getConfig().getString(
+                    "notifications.discordsrv-channel",
+                    "staff-chat"
+            );
+
+            TextChannel textChannel =
+                    DiscordSRV.getPlugin()
+                            .getDestinationTextChannelForGameChannelName(channelName);
+
+            if (textChannel != null) {
+                textChannel.sendMessage("**[NoCure]** " + message).queue();
+            } else {
+                getLogger().warning(
+                        "Could not find DiscordSRV channel: " + channelName
+                );
             }
         }
     }
